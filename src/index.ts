@@ -169,6 +169,75 @@ function findExplanationReply(replies: SlackMessage[], requesterSlackId: string)
   );
 }
 
+async function isChannelMember(env: Env, slackId: string): Promise<boolean> {
+  let cursor: string | undefined;
+  do {
+    const url = new URL("https://slack.com/api/conversations.members");
+    url.searchParams.set("channel", env.SLACK_CHANNEL_ID);
+    url.searchParams.set("limit", "1000");
+    if (cursor) url.searchParams.set("cursor", cursor);
+
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+    });
+    const body = (await res.json()) as {
+      ok: boolean;
+      error?: string;
+      members?: string[];
+      response_metadata?: { next_cursor?: string };
+    };
+    if (!body.ok) {
+      throw new Error(`Slack API error: ${body.error}`);
+    }
+    if (body.members?.includes(slackId)) return true;
+    cursor = body.response_metadata?.next_cursor || undefined;
+  } while (cursor);
+  return false;
+}
+
+// Mentions don't notify users who aren't in the channel, so DM them a link to the thread too.
+async function dmThreadLink(env: Env, slackId: string, threadTs: string): Promise<void> {
+  try {
+    try {
+      if (await isChannelMember(env, slackId)) return;
+    } catch (err) {
+      // If we can't tell, a redundant DM beats a missed notification.
+      console.warn(`Could not check channel membership for ${slackId}; sending DM anyway`, err);
+    }
+
+    const linkUrl = new URL("https://slack.com/api/chat.getPermalink");
+    linkUrl.searchParams.set("channel", env.SLACK_CHANNEL_ID);
+    linkUrl.searchParams.set("message_ts", threadTs);
+    const linkRes = await fetch(linkUrl, {
+      headers: { Authorization: `Bearer ${env.SLACK_BOT_TOKEN}` },
+    });
+    const link = (await linkRes.json()) as { ok: boolean; error?: string; permalink?: string };
+    if (!link.ok || !link.permalink) {
+      console.warn(`Could not get permalink: ${link.error}`);
+      return;
+    }
+
+    const res = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.SLACK_BOT_TOKEN}`,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+      body: JSON.stringify({
+        channel: slackId,
+        text: `👋 I mentioned you in a thread about your recent Claude usage request — reply there and I'll bump your limit: ${link.permalink}`,
+        unfurl_links: false,
+      }),
+    });
+    const body = (await res.json()) as { ok: boolean; error?: string };
+    if (!body.ok) {
+      console.warn(`Could not DM ${slackId}: ${body.error}`);
+    }
+  } catch (err) {
+    console.warn(`Could not DM ${slackId}`, err);
+  }
+}
+
 async function notifyNewRequest(env: Env, request: SpendLimitIncreaseRequest): Promise<ThreadRecord> {
   const slackId = request.actor.email_address
     ? await lookupSlackUserId(env, request.actor.email_address)
@@ -176,6 +245,9 @@ async function notifyNewRequest(env: Env, request: SpendLimitIncreaseRequest): P
   const mention = slackId ? `<@${slackId}>` : null;
 
   const ts = await postSlackMessage(env, messageFor(request, mention));
+  if (slackId) {
+    await dmThreadLink(env, slackId, ts);
+  }
   return { channel: env.SLACK_CHANNEL_ID, threadTs: ts, requesterSlackId: slackId };
 }
 
